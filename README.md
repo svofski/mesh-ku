@@ -1,15 +1,20 @@
-# meshbird
-send files over meshtastic
+# mesh-ku
+```
+slowly send files over meshtastic
 
-The INITIATOR sends file to the RECIPIENT:
+The SENDER sends file to the RECEIVER:
+
+
+Sender side
+===========
 
 initial-state
 
-Creates session session-id
+Creates session with session-id
 
 expect-confirmation:
 
-TEXT_MESSAGE_APP: `MK-SEND file size date crc32 version-string session-id`
+TEXT_MESSAGE_APP: `MK-SEND filename date size block-size crc32 version-string session-id`
 
 sleep INIT-PACE, repeat
 
@@ -37,9 +42,34 @@ Receiver end
 ============
 
 Expect:
+
+
   <- TEXT_MESSAGE_APP with destination = my node
+      `MK-SEND filename date size block-size crc32 version-string session-id`
+
+     if session exists, ignore
+
+     create session session-id
+       initialize bitmap
+
+     session.receive()
+
+  <- PRIVATE_APP: session_id .... -> sessions[session_id].handle_packet()
+
+for session in sessions: session.loop()
+
+session.loop():
+  -> PRIVATE_APP: session-id 0xACCE [bitmap] -- update on all packets
+  sleep BLOCK-PACE
+
+session.handle_packet():
+  if filemap[block_number] == 0:
+    filemape[block_number] = payload
+  
+  
 
 
+```
 
 
 ```mermaid
