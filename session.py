@@ -15,6 +15,7 @@ from pubsub import pub
 
 from meshku import *
 
+
 def get_channel_stats(iface):
     node_info = iface.getMyNodeInfo()
     dm = node_info.get("deviceMetrics", {})
@@ -22,10 +23,10 @@ def get_channel_stats(iface):
     air_tx = dm.get("airUtilTx")
     return f"ChUtil: {ch_util:.2f}% AirUtilTx: {air_tx:.2f}%"
     
-def send_immediate_refuse(iface, sid, destId):
+def send_immediate_refuse(iface, sid, destId, why=b""):
     sid = session_id_as_array(sid)
     data = sid + [0xfe, 0xcc];
-    iface.sendData(bytes(data), destinationId=destId, portNum=DATA_APP, wantAck=False)
+    iface.sendData(bytes(data) + why, destinationId=destId, portNum=DATA_APP, wantAck=False)
 
 def send_immediate_general_ack(iface, sid, destId):
     data = session_id_as_array(sid) + [0xba, 0xbe]
@@ -54,10 +55,27 @@ def create_unique_session_id():
     return session_id_hash
 
 
+def set_timestamp(path, timestamp_str):
+    ts = int(timestamp_str)
+    # set both atime and mtime to the same value
+    os.utime(path, (ts, ts))
+
 def get_timestamp(path):
     mod_time_float = os.path.getmtime(path)
     mod_time_int = int(mod_time_float)
     return str(mod_time_int)
+
+def read_file(path):
+    try:
+        timestamp = get_timestamp(path)
+        crc32 = 0
+        content = None
+        with open(path, "rb") as file:
+            content = bytearray(file.read())
+            crc32 = zlib.crc32(content)
+        return content, timestamp, crc32
+    except:
+        return None, 0, 0
 
 def chunk_bytearray(data, chunk_size):
     """Yields chunks of a bytearray of a specified size."""
@@ -101,13 +119,8 @@ class Session:
         if self.session_id == None:
             self.session_id = create_unique_session_id()[-8::]
 
-        self.file_timestamp = get_timestamp(self.file_path)
-
-        content = None
-        with open(self.file_path, "rb") as file:
-            content = bytearray(file.read())
-            self.file_size = len(content)
-            self.crc32 = zlib.crc32(content)
+        content, self.file_timestamp, self.crc32 = read_file(self.file_path)
+        self.file_size = len(content)
 
         if content != None:
             self.blocks = list(chunk_bytearray(content, self.block_size))
@@ -121,24 +134,27 @@ class Session:
         file_name = Path(self.file_path).name
         return f"{HELLO_PREFIX} {file_name} {self.file_timestamp} {self.file_size} {self.block_size} {self.crc32} {MESHKU_VERSION_STR} {self.session_id}"
 
+    # check if a local file already exists
+    def same_file_exists(self):
+        content, timestamp, crc32 = read_file(self.file_path)
+        return timestamp == self.file_timestamp and crc32 == self.crc32 and len(content) == self.file_size
+
     def parse_initial_packet(self, text) -> bool:
-        print(f"parse_initial_packet: text=[{text}]")
+        #print(f"parse_initial_packet: text=[{text}]")
         try:
             parts = text.split(" ")
-            print(f"parse_initial_packet: parts={repr(parts)}")
+            #print(f"parse_initial_packet: parts={repr(parts)}")
 
             if parts[0] != HELLO_PREFIX:
                 return False
 
             self.file_path = parts[1]
-            self.file_timestamp = int(parts[2])
+            self.file_timestamp = parts[2]
             self.file_size = int(parts[3])
             self.block_size = int(parts[4])
             self.crc32 = int(parts[5])
             self.sender_version = parts[6]
             self.session_id = parts[7]
-
-            print(str(self))
 
             return True
         except Fuu:
@@ -265,7 +281,7 @@ class Session:
     def data_packet_received(self, _data):
         if self.state != STATE_RECEIVE:
             print(f"Unexpected data packet, REFUSE\n{dump(_data)}")
-            send_immediate_refuse(self.iface, self.session_id, self.destinationId)
+            send_immediate_refuse(self.iface, self.session_id, self.destinationId, b'Unexpected data packet')
 
         data = _data[2:] # strip 0xDADA from the start
         block_num, block_len = struct.unpack_from('<HB', data, 0)
@@ -315,11 +331,12 @@ class Session:
                 return
 
         if not self.state in [STATE_INITIATE_SEND, STATE_SEND]:
-            print(f"Unexpected status packet state={self.state} data={repr(data)}")
+            print(f"Unexpected status packet state={self.state}\n{dump(data)}")
 
         print(f"status_packet_received: code={code:04X}\n{dump(data)}")
         if code == 0xFECC:
-            print(f"Recipient refused, abort")
+            why = data[2:].decode("utf-8")
+            print(f"Recipient refused: {why}, ABORT")
             self.state = STATE_ABORTED
             return
 
@@ -391,8 +408,11 @@ class Session:
         my_crc32 = zlib.crc32(contents)
         if my_crc32 != self.crc32:
             raise ValueError(f"CRC32 error in {self.file_path} mine: {my_crc32:08x} theirs: {self.crc32}")
-        with open(self.file_path, "wb") as f:
+
+        fname = safe_filename(self.file_path)
+        with open(fname, "wb") as f:
             f.write(contents)
+        set_timestamp(self.file_path, self.file_timestamp)
 
     def matches(self, other):
         return False
@@ -413,6 +433,19 @@ class Scheduler:
         print(f"Connected to: {self.shortName} {self.longName} {self.id}")
         pub.subscribe(self.on_receive, "meshtastic.receive")
 
+    def find_existing_session(self, newsession):
+        for sid,s in self.sessions.items():
+            if s.file_path == newsession.file_path and \
+                s.file_size == newsession.file_size and \
+                s.crc32 == newsession.crc32 and \
+                s.block_size == newsession.block_size and \
+                s.file_timestamp == newsession.file_timestamp:
+                
+                return sid, s
+
+        return None, None
+
+
     def on_receive(self, packet, interface):
         #print(repr(packet))
         portnum = packet.get("decoded", {}).get("portnum")
@@ -430,22 +463,24 @@ class Scheduler:
             print(f"TEXT_MESSAGE_APP text={text}")
             s = Session()
             if s.parse_initial_packet(text):
+                # check if exactly the same file exists
+                if s.same_file_exists():
+                    send_immediate_refuse(self.iface, s.session_id, fromId, b'File already exists') 
+                    self.refused_sessions[s.session_id] = s.session_id
                 # send request, remember session, initiate reception
-                # TODO: find old session by file_path 
-                if s.session_id in self.sessions:
-                    old = self.sessions[s.session_id]
-                    if old.matches(s):
-                        print(f"Found old session {s.session_id} that matches {s.file_path}, ignoring new request")
-                        pass # just continue the old session
-                    else:
-                        print(f"Old session {old.session_id} does not match new metadata for {s.file_path}, replacing old session")
-                        old.abort()
-                        self.sessions[s.session_id] = s
-                        s.start_receive(interface, fromId)
-                else:
+                old_sid, old_session = self.find_existing_session(s)
+                if old_session == None:
                     print(f"New session {s.session_id} for file {s.file_path}")
                     self.sessions[s.session_id] = s
                     s.start_receive(interface, fromId)
+                else:
+                    # discard the new session, update the old session with new id
+                    if old_session.session_id != s.session_id:
+                        old_session.session_id = s.session_id
+                        self.sessions[s.session_id] = old_session
+                        del self.sessions[old_sid]
+                        self.refused_sessions[old_sid] = old_sid
+                        print(f"Found old session {old_sid}, updating to {s.session_id}")
         elif portnum == DATA_APP:
             sid = self.get_session_id(payload)
             code = 0
@@ -462,7 +497,7 @@ class Scheduler:
                 else:
                     self.refused_sessions[sid] = sid
                     print(f"DATA_APP sid={sid} is unknown, REFUSE")
-                    send_immediate_refuse(self.iface, sid, fromId)
+                    send_immediate_refuse(self.iface, sid, fromId, b'Unknown session')
 
     # returns 4-byte session id as 8-character string
     def get_session_id(self, bytes):
@@ -500,7 +535,6 @@ class Scheduler:
 
 def tets():
     s=Session()
-    #s.parse_initial_packet("KU! test.txt 1759273808 31474 64 1618607525 V001 b07c0356")
     s.parse_initial_packet("KU! test.txt 1759394612 157 64 444085881 V001 c8e4a0f9")
     s.start_receive(None, "!abcd")
     return s

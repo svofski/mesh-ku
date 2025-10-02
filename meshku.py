@@ -1,3 +1,5 @@
+import os
+
 DEFAULT_BLOCK_SIZE=128
 MAX_RESEND_COUNT=333
 MESHKU_VERSION_STR="V001"
@@ -62,3 +64,14 @@ def dump(data):
         text += f"{hexual:56s}  {charals:16s}\n"
         
     return text
+
+def safe_filename(fname):
+    base, ext = os.path.splitext(fname)
+    counter = 1
+    newname = fname
+    while os.path.exists(newname):
+        newname = f"{base}_{counter}{ext}"
+        counter += 1
+    return newname
+
+
