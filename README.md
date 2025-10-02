@@ -2,8 +2,20 @@
 ```
 slowly send files over meshtastic
 
-The SENDER sends file to the RECEIVER:
 
+DATA_APP packets
+
+Accept/status:
+  session_id:u32 0xAC 0xCE [status map] (one status bit per packet)
+
+General ack (e.g. sender acknowledges transfer completion)
+  session_id:u32 0xBA 0xBE
+
+Refusal:
+  session_id:u32 0xFE 0xCC
+
+Data:
+  session_id:u32 0xDA 0xDA block-num:u16 byte-count:u8 [data] crc32:u32
 
 Sender side
 ===========
