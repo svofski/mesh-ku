@@ -1,20 +1,32 @@
 # mesh-ku
-```
-slowly send files over meshtastic
 
+Slowly send files over meshtastic.
 
-DATA_APP packets
+## TEXT_MESSAGE_APP packets
 
-Accept/status:
-  session_id:u32 0xAC 0xCE [status map] (one status bit per packet)
+Initiate send:
 
-General ack (e.g. sender acknowledges transfer completion)
+  KU! filename.ext unix-time file-size block-size file-crc32 version-string session-id 
+
+The receiver may respond with ACCEPT or REFUSE. The sender gets ACCEPT
+packet and proceeds with sending based on the status map.
+
+REFUSE can mean that the file already exists and size/crc32 match.
+
+## DATA_APP packets
+
+ACCEPT/STATUS:
+
+  `session_id:u32 0xAC 0xCE [status map] (one status bit per packet)`
+
+GENERAL ACK (e.g. sender acknowledges transfer completion)
+
   session_id:u32 0xBA 0xBE
 
-Refusal:
-  session_id:u32 0xFE 0xCC
+REFUSE:
+  session_id:u32 0xFE 0xCC b'byte-encoded reason'
 
-Data:
+DATA:
   session_id:u32 0xDA 0xDA block-num:u16 byte-count:u8 [data] crc32:u32
 
 Sender side

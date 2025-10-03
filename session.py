@@ -408,7 +408,7 @@ class Session:
                 self.delay -= 1
         elif self.state == STATE_SEND:
             if self.delay <= 0:
-                self.delay = BODY_INTERVAL_TICKS + random.randint(-3,3)
+                self.delay = BODY_INTERVAL_TICKS + random.randint(-BODY_INTERVAL_SPREAD,BODY_INTERVAL_SPREAD)
                 self.send_data_packet()
         elif self.state == STATE_RECEIVE:
             if self.delay <= 0:

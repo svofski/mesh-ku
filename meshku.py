@@ -10,7 +10,8 @@ TICK_TIME=0.25
 
 SEND_START_INTERVAL_TICKS=15//TICK_TIME
 STATUS_INTERVAL_TICKS=10//TICK_TIME
-BODY_INTERVAL_TICKS=4//TICK_TIME
+BODY_INTERVAL_TICKS=3//TICK_TIME
+BODY_INTERVAL_SPREAD=3
 # 1: 17.0cps ratio 4.5
 # 2: 19.8cps ratio 2.38
 # 3: 20.0cps ratio 1.62
@@ -21,6 +22,11 @@ BODY_INTERVAL_TICKS=4//TICK_TIME
 # 4: 19.3 ratio 1.59 10m24s sender 10m18s receiver
 # 4 +/-3 randomizer: ratio: 1.33 elapsed: 9m 2s cps: 22.2
 #   
+# IN FOIL 4 +/-3
+# Sending ADSKOK.ROM complete; blocks: 94 sent: 215 ratio: 2.29 elapsed: 14m 56s cps: 13.4
+# NO FOIL 4 +/-3
+# Sending ADSKOK.ROM complete; blocks: 94 sent: 130 ratio: 1.38 elapsed: 9m 4s cps: 22.1
+# NO FOIL 3 +/-3 blocks: 94 sent: 170 ratio: 1.81 elapsed: 9m 1s cps: 22.2 (but receiver shows cps 24.9)
 
 # meshtastic port numbers 
 TEXT_MESSAGE_APP = 1
