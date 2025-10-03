@@ -9,7 +9,12 @@ good things come to those who wait                                              
                                                                                    `  `
 ```
 
-mesh-ku works via Meshtastic Python API on Serial interface. In order to use it you need nodes connected to computers via serial and up to date Python with Meshtastic library installed.
+In order to send a file over the air you need two nodes connected to computers via serial interface.  
+
+mesh-ku is written in Python and needs up to date Python with Meshtastic library installed. If unsure, try
+```
+pip3 install meshtastic
+```
 
 This is dangerous experimental software. It will overwrite files and do other nasty things when you look away.
 
