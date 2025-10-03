@@ -4,12 +4,14 @@ mesh-ku
 Send files without haste using Meshtastic.
 
 ```
-    __
- ",/__\_    ... 20 cps .  .     .
-   `  `
+                                                                                    __
+good things come to those who wait                                               ",/__\_    ... 20 cps .  .     .
+                                                                                   `  `
 ```
 
-mesh-ku works via Meshtastic Python API on Serial interface. In order to use it you need nodes connected to computers via serial, up to date Python with Meshtastic library installed. This is experimental software.
+mesh-ku works via Meshtastic Python API on Serial interface. In order to use it you need nodes connected to computers via serial and up to date Python with Meshtastic library installed.
+
+This is dangerous experimental software. It will overwrite files and do other nasty things when you look away.
 
 Basic usage
 -----------
