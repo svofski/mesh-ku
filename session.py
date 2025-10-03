@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os, sys
 import zlib
 from pathlib import Path
@@ -107,16 +108,72 @@ def chunk_bytearray(data, chunk_size):
     for i in range(0, len(data), chunk_size):
         yield data[i:i + chunk_size]
 
+class StatusMap:
+    # convert blocks map into bitmap for status report,  0 = need, 1 = received
+    @staticmethod
+    def encode(session) -> list[int]:
+        filemap = []
+        byte = 0
+        nbits = (len(session.blocks) + 7) & ~7
+        for n in range(nbits):
+            yesno = int(len(session.blocks[n]) > 0) if n < len(session.blocks) else 1
+            byte = (byte << 1) | yesno
+            if (n + 1) % 8 == 0:
+                filemap.append(byte)
+                byte = 0
+        return filemap
+
+    # bytes from the status packet -> 1 number per block: 0 = missing, 1 = received
+    @staticmethod
+    def decode(bytes: bytes) -> list[int]:
+        filemap = []
+        for n in range(len(bytes)):
+            b = bytes[n]
+            for i in range(8):
+                yesno = int((b & 0x80) != 0)
+                filemap.append(yesno)
+                b <<= 1
+        return filemap
+
+class Stats:
+    def __init__(self):
+        self.num_blocks = 0
+        self.file_size = 0
+        self.blocks_sent = 0
+        self.blocks_received = 0
+        self.blocks_rejected = 0
+        self.start_time = 0
+
+    def begin(self, file_size, num_blocks):
+        self.num_blocks = num_blocks
+        self.file_size = file_size
+        self.start_time = time.monotonic()
+
+    def send_stats(self):
+        ratio = self.blocks_sent / self.num_blocks
+        elapsed = time.monotonic() - self.start_time
+        cps = self.file_size / elapsed
+        fmts = format_seconds(elapsed)
+        text = f"blocks: {self.num_blocks} sent: {self.blocks_sent} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
+        return text
+
+    def recv_stats(self):
+        elapsed = time.monotonic() - self.start_time
+        cps = self.file_size / elapsed
+        fmts = format_seconds(elapsed)
+        ratio = self.blocks_received / self.num_blocks
+        text = f"blocks: {self.num_blocks} received: {self.blocks_received} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
+        return text
+
+
 STATE_INITIAL = 0
 STATE_INITIATE_SEND = 2
 STATE_SEND = 3
-
 STATE_RECEIVE = 10
 STATE_RECEIVE_FINISHING = 11
-
 STATE_FINISHED = 100
-
 STATE_ABORTED = 255
+
 
 class Session:
     def __init__(self, file_path = None, session_id = None, block_size = DEFAULT_BLOCK_SIZE):
@@ -135,14 +192,25 @@ class Session:
         self.send_map = []      # smallest number gets sent, 
         self.resend_map = []
         self.retry_count = 0
-        self.blocks_sent = 0
-        self.blocks_received = 0
-        self.blocks_rejected = 0
-        self.start_time = 0
+        self.stats = Stats()
 
-    def abort(self):
-        if self.state == STATE_RECEIVE:
-            self.state = STATE_ABORTED
+    def __str__(self):
+        return f"Session: file_path={self.file_path} file_timestamp={self.file_timestamp} file_size={self.file_size} " + \
+                f"block_size: {self.block_size} crc32: {self.crc32} sender_version={self.sender_version} session_id={self.session_id}"
+
+
+    #
+    # SENDER SIDE ------------->
+    #
+
+    # s = Session(path)
+    # s.start_send(iface, recipient)
+    def start_send(self, iface, destinationId):
+        self.iface = iface
+        self.destinationId = destinationId
+        self.state = STATE_INITIATE_SEND
+        self.delay = 0
+        self.prepare_to_send()
 
     def prepare_to_send(self):
         if self.session_id == None:
@@ -158,97 +226,10 @@ class Session:
         self.resend_map = [0] * len(self.blocks)
 
         logger.debug(f"Prepared to send {self.file_path}: {len(self.blocks)} blocks, bs={self.block_size}")
-        
+
     def make_send_request(self):
         file_name = Path(self.file_path).name
         return f"{HELLO_PREFIX} {file_name} {self.file_timestamp} {self.file_size} {self.block_size} {self.crc32} {MESHKU_VERSION_STR} {self.session_id}"
-
-    # check if a local file already exists
-    def same_file_exists(self):
-        content, timestamp, crc32 = read_file(self.file_path)
-        return timestamp == self.file_timestamp and crc32 == self.crc32 and len(content) == self.file_size
-
-    def parse_initial_packet(self, text) -> bool:
-        #print(f"parse_initial_packet: text=[{text}]")
-        try:
-            parts = text.split(" ")
-            #print(f"parse_initial_packet: parts={repr(parts)}")
-
-            if parts[0] != HELLO_PREFIX:
-                return False
-
-            self.file_path = parts[1]
-            self.file_timestamp = parts[2]
-            self.file_size = int(parts[3])
-            self.block_size = int(parts[4])
-            self.crc32 = int(parts[5])
-            self.sender_version = parts[6]
-            self.session_id = parts[7]
-
-            return True
-        except Fuu:
-            return False
-
-    def __str__(self):
-        return f"Session: file_path={self.file_path} file_timestamp={self.file_timestamp} file_size={self.file_size} " + \
-                f"block_size: {self.block_size} crc32: {self.crc32} sender_version={self.sender_version} session_id={self.session_id}"
-
-    def init_blocks(self):
-        nblocks = math.ceil(self.file_size / self.block_size)
-        self.blocks = [[]] * nblocks
-
-    # convert blocks map into bitmap for status report,  0 = need, 1 = received
-    def make_status_map(self):
-        filemap = []
-        byte = 0
-        nbits = (len(self.blocks) + 7) & ~7
-        for n in range(nbits):
-            yesno = int(len(self.blocks[n]) > 0) if n < len(self.blocks) else 1
-            byte = (byte << 1) | yesno
-            if (n + 1) % 8 == 0:
-                filemap.append(byte)
-                byte = 0
-        return filemap
-
-    # bytes from the status packet -> 1 number per block: 0 = missing, 1 = received
-    def decode_status_map(self, bytes):
-        filemap = []
-        for n in range(len(bytes)):
-            b = bytes[n]
-            for i in range(8):
-                yesno = int((b & 0x80) != 0)
-                filemap.append(yesno)
-                b <<= 1
-        return filemap
-
-
-    def start_receive(self, iface, senderId):
-        self.iface = iface
-        self.destinationId = senderId
-        self.state = STATE_RECEIVE
-        self.delay = 0
-        self.init_blocks()
-        self.start_time = time.monotonic()
-        logger.info(f"start_receive: from {senderId} expecting {len(self.blocks)} blocks")
-
-
-    def start_send(self, iface, destinationId, path):
-        self.iface = iface
-        self.destinationId = destinationId
-        self.state = STATE_INITIATE_SEND
-        self.delay = 0
-        self.prepare_to_send()
-
-    # data is raw packet data with session_id stripped
-    def packet_received(self, data):
-        code, = struct.unpack_from('>H', data, 0)
-
-        if code in [0xACCE, 0xFECC, 0xBABE]:
-            self.status_packet_received(data)
-        elif code == 0xDADA:
-            self.data_packet_received(data)
-        else:
-            logger.debug(f"Unknown packet type: {code:04X}, IGNORE\n{dump(data)}") 
 
     # pick block with smallest value in send_map, excluding +inf blocks
     # replace picked index count with number of remaining blocks
@@ -294,16 +275,111 @@ class Session:
         
         data = self.make_data_packet(pick)
         self.iface.sendData(data, destinationId=self.destinationId, portNum=DATA_APP, wantAck=False)
-        self.blocks_sent += 1
+        self.stats.blocks_sent += 1
 
         logger.debug(f"send_data_packet: sent block #{pick}")
+
+    # sender receives a status packet: 0xAC 0xCE [bitmap]
+    # updates send_map, finishes session if told off or transfer complete
+    def status_packet_received(self, data):
+        code, = struct.unpack_from('>H', data, 0)
+
+        if self.state == STATE_RECEIVE_FINISHING:
+            # am receiver, waiting for sender to acknowledge finished transfer
+            if code == 0xBABE:
+                self.state = STATE_FINISHED
+                logger.warning(f"Sender acknowledged, finished session")
+                return
+
+        if not self.state in [STATE_INITIATE_SEND, STATE_SEND]:
+            logger.debug(f"Unexpected status packet state={self.state}\n{dump(data)}")
+
+        logger.debug(f"status_packet_received: code={code:04X}\n{dump(data)}")
+        if code == 0xFECC:
+            why = data[2:].decode("utf-8")
+            logger.warning(f"Recipient refused: {why}, ABORT")
+            self.state = STATE_ABORTED
+            return
+
+        if code != 0xACCE:
+            logger.debug(f"Unknown packet type {code:04X}, IGNORE\n{dump(data)}")
+        status = data[2:]
+        update = StatusMap.decode(status)
+        
+        remain = 0
+        for n in range(min(len(self.send_map), len(update))):
+            if update[n] != 0:
+                self.send_map[n] = math.inf # mark block as complete
+            else:
+                remain += 1
+        sent = len(self.blocks) - remain
+
+        logger.warning(f"Sent {sent}/{len(self.blocks)}: [{str_send_map(self.send_map, self.resend_map)}] {get_channel_stats(self.iface)}")
+
+        if remain == 0:
+            logger.warning(f"Sending {self.file_path} complete; {self.stats.send_stats()}")
+            send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
+            send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
+            send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
+            self.state = STATE_FINISHED
+
+        # good to go
+        if self.state == STATE_INITIATE_SEND:
+            self.state = STATE_SEND
+
+
+
+    #
+    # RECEIVER SIDE <------------
+    #
+
+    # check if a local file already exists
+    def same_file_exists(self):
+        content, timestamp, crc32 = read_file(self.file_path)
+        return timestamp == self.file_timestamp and crc32 == self.crc32 and len(content) == self.file_size
+
+    # parse KU! packet
+    def parse_initial_packet(self, text) -> bool:
+        logger.debug(f"parse_initial_packet: text=[{text}]")
+        try:
+            parts = text.split(" ")
+
+            if parts[0] != HELLO_PREFIX:
+                return False
+
+            self.file_path = parts[1]
+            self.file_timestamp = parts[2]
+            self.file_size = int(parts[3])
+            self.block_size = int(parts[4])
+            self.crc32 = int(parts[5])
+            self.sender_version = parts[6]
+            self.session_id = parts[7]
+
+            return True
+        except:
+            return False
+
+    # initialise self.blocks[] based on received metadata
+    def init_blocks(self):
+        nblocks = math.ceil(self.file_size / self.block_size)
+        self.blocks = [[]] * nblocks
+
+    # enter RECEIVE state, expect data
+    def start_receive(self, iface, senderId):
+        self.iface = iface
+        self.destinationId = senderId
+        self.state = STATE_RECEIVE
+        self.delay = 0
+        self.init_blocks()
+        self.stats.begin(self.file_size, len(self.blocks))
+        logger.info(f"start_receive: from {senderId} expecting {len(self.blocks)} blocks")
 
     # uint16_t block-num
     # uint8_t byte-count
     # uint8_t array[byte-count]
     # uint32_t crc32
     def data_packet_received(self, _data):
-        self.blocks_received += 1
+        self.stats.blocks_received += 1
 
         if self.state != STATE_RECEIVE:
             logger.debug(f"Unexpected data packet, REFUSE\n{dump(_data)}")
@@ -328,7 +404,7 @@ class Session:
         # good block
         if len(self.blocks[block_num]) > 0:
             logger.debug(f"Block #{block_num} is dupe, IGNORE")
-            self.blocks_rejected += 1
+            self.stats.blocks_rejected += 1
             return
         
         self.blocks[block_num] = block_data
@@ -339,60 +415,40 @@ class Session:
         have = recv_map.count("#")
         logger.warning(f"Received {have}/{len(recv_map)} blocks: [{recv_map}] {get_channel_stats(self.iface)}");
         if recv_map.find('.') == -1:
-            logger.warning(f"Received all blocks, finishing; {self.get_recv_stats()}")
+            logger.warning(f"Received all blocks, finishing; {self.stats.recv_stats()}")
             self.state = STATE_RECEIVE_FINISHING
             self.retry_count = 3
             self.save_received_file()
         
+    def send_status_packet(self):
+        sid = session_id_as_array(self.session_id)
+        data = sid + [0xac, 0xce] + StatusMap.encode(self)
+        self.iface.sendData(bytes(data), destinationId=self.destinationId, portNum=DATA_APP, wantAck=False)
+        logger.debug(f"send_status_packet:\n{dump(data)}")
 
-    # 0xAC 0xCE [buttmap]
-    def status_packet_received(self, data):
+    def save_received_file(self):
+        contents = b''.join(self.blocks)
+        my_crc32 = zlib.crc32(contents)
+        if my_crc32 != self.crc32:
+            raise ValueError(f"CRC32 error in {self.file_path} mine: {my_crc32:08x} theirs: {self.crc32}")
+
+        fname = safe_filename(self.file_path)
+        with open(fname, "wb") as f:
+            f.write(contents)
+        set_timestamp(self.file_path, self.file_timestamp)
+
+    # data is raw packet data with session_id stripped
+    def packet_received(self, data):
         code, = struct.unpack_from('>H', data, 0)
 
-        if self.state == STATE_RECEIVE_FINISHING:
-            # am receiver, waiting for sender to acknowledge finished transfer
-            if code == 0xBABE:
-                self.state = STATE_FINISHED
-                logger.warning(f"Sender acknowledged, finished session")
-                return
+        if code in [0xACCE, 0xFECC, 0xBABE]:
+            self.status_packet_received(data)
+        elif code == 0xDADA:
+            self.data_packet_received(data)
+        else:
+            logger.debug(f"Unknown packet type: {code:04X}, IGNORE\n{dump(data)}") 
 
-        if not self.state in [STATE_INITIATE_SEND, STATE_SEND]:
-            logger.debug(f"Unexpected status packet state={self.state}\n{dump(data)}")
-
-        logger.debug(f"status_packet_received: code={code:04X}\n{dump(data)}")
-        if code == 0xFECC:
-            why = data[2:].decode("utf-8")
-            logger.warning(f"Recipient refused: {why}, ABORT")
-            self.state = STATE_ABORTED
-            return
-
-        if code != 0xACCE:
-            logger.debug(f"Unknown packet type {code:04X}, IGNORE\n{dump(data)}")
-        status = data[2:]
-        update = self.decode_status_map(status)
-        
-        remain = 0
-        for n in range(min(len(self.send_map), len(update))):
-            if update[n] != 0:
-                self.send_map[n] = math.inf # mark block as complete
-            else:
-                remain += 1
-        sent = len(self.blocks) - remain
-
-        logger.warning(f"Sent {sent}/{len(self.blocks)}: [{str_send_map(self.send_map, self.resend_map)}] {get_channel_stats(self.iface)}")
-
-        if remain == 0:
-            logger.warning(f"Sending {self.file_path} complete; {self.get_send_stats()}")
-            send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
-            send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
-            send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
-            self.state = STATE_FINISHED
-
-        # good to go
-        if self.state == STATE_INITIATE_SEND:
-            self.state = STATE_SEND
-
-
+    # scheduler tick
     def tick(self):
         #print(f"TICK: {self.session_id} S={self.state}")
         self.delay -= 1
@@ -402,7 +458,7 @@ class Session:
                 self.delay = SEND_START_INTERVAL_TICKS
                 sendrq = self.make_send_request()
                 logger.debug(f"sendrq: [{sendrq}]")
-                self.start_time = time.monotonic()
+                self.stats.begin(self.file_size, len(self.blocks))
                 self.iface.sendData(sendrq.encode("utf-8"), destinationId=self.destinationId, portNum=HELLO_APP, wantAck=False)
             else:
                 self.delay -= 1
@@ -424,39 +480,11 @@ class Session:
 
         return self.state != STATE_ABORTED and self.state != STATE_FINISHED
 
-    def send_status_packet(self):
-        sid = session_id_as_array(self.session_id)
-        data = sid + [0xac, 0xce] + self.make_status_map()
-        self.iface.sendData(bytes(data), destinationId=self.destinationId, portNum=DATA_APP, wantAck=False)
-        logger.debug(f"send_status_packet:\n{dump(data)}")
 
-    def save_received_file(self):
-        contents = b''.join(self.blocks)
-        my_crc32 = zlib.crc32(contents)
-        if my_crc32 != self.crc32:
-            raise ValueError(f"CRC32 error in {self.file_path} mine: {my_crc32:08x} theirs: {self.crc32}")
-
-        fname = safe_filename(self.file_path)
-        with open(fname, "wb") as f:
-            f.write(contents)
-        set_timestamp(self.file_path, self.file_timestamp)
-
-    def get_send_stats(self):
-        ratio = self.blocks_sent / len(self.blocks)
-        elapsed = time.monotonic() - self.start_time
-        cps = self.file_size / elapsed
-        fmts = format_seconds(elapsed)
-        text = f"blocks: {len(self.blocks)} sent: {self.blocks_sent} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
-        return text
-
-    def get_recv_stats(self):
-        elapsed = time.monotonic() - self.start_time
-        cps = self.file_size / elapsed
-        fmts = format_seconds(elapsed)
-        ratio = self.blocks_received / len(self.blocks)
-        text = f"blocks: {len(self.blocks)} received: {self.blocks_received} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
-        return text
-
+# creates sessions
+# accepts incoming packets and routes them to corresponding sessions
+# calls Session.tick() for active sessions
+# kills old sessions
 class Scheduler:
     def __init__(self):
         self.sessions = {}
@@ -484,7 +512,6 @@ class Scheduler:
                 return sid, s
 
         return None, None
-
 
     def on_receive(self, packet, interface):
         #print(repr(packet))
@@ -557,9 +584,8 @@ class Scheduler:
 
         logger.warning(f"Found {recipient}: {dstId} {longId}")
 
-        s.start_send(self.iface, dstId, path)
+        s.start_send(self.iface, dstId)
         self.sessions[s.session_id] = s
-        #def __init__(self, file_path = None, session_id = None, block_size = DEFAULT_BLOCK_SIZE):
 
     def sched(self):
         kills = []
@@ -584,7 +610,7 @@ def tets2():
     s.parse_initial_packet("KU! test.txt 1759394612 157 64 444085881 V001 c8e4a0f9")
     s.start_receive(None, "!abcd")
     s.blocks=[[1],[1],[],[],[1],[1],[1],[1],[],[1],[]]
-    decoded = s.decode_status_map(s.make_status_map())
+    decoded = StatusMap.decode(StatusMap.encode(s))
     print(f"status map decoded: {repr(decoded)}")
     return s
 
