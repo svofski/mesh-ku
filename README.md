@@ -1,9 +1,7 @@
 mesh-ku
 =======
 
-Slowly send files over meshtastic.
-
-#TOC
+Slowly send files over Meshtastic.
 
 Packet types
 ------------
