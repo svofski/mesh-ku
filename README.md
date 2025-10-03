@@ -1,7 +1,28 @@
 mesh-ku
 =======
 
-Slowly send files over Meshtastic.
+Send files without haste using Meshtastic.
+
+```
+    __
+ ",/__\_    ... 20 cps .  .     .
+   `  `
+```
+
+mesh-ku works via Meshtastic Python API on Serial interface. In order to use it you need nodes connected to computers via serial, up to date Python with Meshtastic library installed. This is experimental software.
+
+Basic usage
+-----------
+
+Wait for incoming files. Files will be saved in the current directory.
+
+`python3 session.py receive`
+
+Send a file. Destination can be a short or long name or full node id. Path to file will be stripped.
+
+`python3 session.py send path/to/file.ext <destination>`
+
+
 
 Packet types
 ------------
