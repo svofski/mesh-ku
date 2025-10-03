@@ -10,7 +10,17 @@ TICK_TIME=0.25
 
 SEND_START_INTERVAL_TICKS=15//TICK_TIME
 STATUS_INTERVAL_TICKS=10//TICK_TIME
-BODY_INTERVAL_TICKS=3//TICK_TIME
+BODY_INTERVAL_TICKS=4//TICK_TIME
+# 1: 17.0cps ratio 4.5
+# 2: 19.8cps ratio 2.38
+# 3: 20.0cps ratio 1.62
+# 4: 20.9cps ratio 1.25
+# 5: 15.4cps ratio 1.38
+
+# longer test (ADSKOK)
+# 4: 19.3 ratio 1.59 10m24s sender 10m18s receiver
+# 4 +/-3 randomizer: ratio: 1.33 elapsed: 9m 2s cps: 22.2
+#   
 
 # meshtastic port numbers 
 TEXT_MESSAGE_APP = 1
@@ -74,4 +84,15 @@ def safe_filename(fname):
         counter += 1
     return newname
 
+def format_seconds(seconds: int) -> str:
+    seconds = int(seconds)
+    h, m = divmod(seconds, 3600)
+    m, s = divmod(m, 60)
 
+    parts = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)

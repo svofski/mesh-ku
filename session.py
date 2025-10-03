@@ -13,7 +13,32 @@ import meshtastic.serial_interface
 import meshtastic.tcp_interface
 from pubsub import pub
 
+import logging
+
 from meshku import *
+
+logger=None
+
+def setup_logger(role):
+    logger = logging.getLogger("mesh-ku-" + role)
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    fh1 = logging.FileHandler(role + "-events.log")
+    fh1.setLevel(logging.INFO)
+    fh1.setFormatter(fmt)
+    logger.addHandler(fh1)
+
+    fh2 = logging.FileHandler(role + "-debug.log")
+    fh2.setLevel(logging.DEBUG)
+    fh2.setFormatter(fmt)
+    logger.addHandler(fh2)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    return logger
 
 
 def get_channel_stats(iface):
@@ -110,6 +135,10 @@ class Session:
         self.send_map = []      # smallest number gets sent, 
         self.resend_map = []
         self.retry_count = 0
+        self.blocks_sent = 0
+        self.blocks_received = 0
+        self.blocks_rejected = 0
+        self.start_time = 0
 
     def abort(self):
         if self.state == STATE_RECEIVE:
@@ -128,7 +157,7 @@ class Session:
         self.send_map = list(range(len(self.blocks)))
         self.resend_map = [0] * len(self.blocks)
 
-        print(f"Prepared to send {self.file_path}: {len(self.blocks)} blocks, bs={self.block_size}")
+        logger.debug(f"Prepared to send {self.file_path}: {len(self.blocks)} blocks, bs={self.block_size}")
         
     def make_send_request(self):
         file_name = Path(self.file_path).name
@@ -199,7 +228,8 @@ class Session:
         self.state = STATE_RECEIVE
         self.delay = 0
         self.init_blocks()
-        print(f"start_receive: from {senderId} expecting {len(self.blocks)} blocks")
+        self.start_time = time.monotonic()
+        logger.info(f"start_receive: from {senderId} expecting {len(self.blocks)} blocks")
 
 
     def start_send(self, iface, destinationId, path):
@@ -218,7 +248,7 @@ class Session:
         elif code == 0xDADA:
             self.data_packet_received(data)
         else:
-            print(f"Unknown packet type: {code:04X}, IGNORE\n{dump(data)}") 
+            logger.debug(f"Unknown packet type: {code:04X}, IGNORE\n{dump(data)}") 
 
     # pick block with smallest value in send_map, excluding +inf blocks
     # replace picked index count with number of remaining blocks
@@ -235,13 +265,6 @@ class Session:
         
         s[index] = len(s) - 1  # make the picked block the last to retransmit
         return index
-
-
-    def pick_at_random(self, s):
-        candidates = [i for i in range(len(s)) if s[i] in {'>', '.'}]
-        if not candidates:
-            return -1
-        return random.choice(candidates)
 
     # uint32_t session_id
     # uint16_t 0xDADA
@@ -265,22 +288,25 @@ class Session:
         pick = self.pick_block_to_send(self.send_map) 
         if pick == -1:
             self.state = STATE_FINISHED
-            print(f"Sending {self.file_path} complete")
+            logger.warning(f"Sending {self.file_path} complete")
             return False
         self.resend_map[pick] += 1
         
         data = self.make_data_packet(pick)
         self.iface.sendData(data, destinationId=self.destinationId, portNum=DATA_APP, wantAck=False)
+        self.blocks_sent += 1
 
-        print(f"send_data_packet: sent block #{pick} {get_channel_stats(self.iface)}")
+        logger.debug(f"send_data_packet: sent block #{pick}")
 
     # uint16_t block-num
     # uint8_t byte-count
     # uint8_t array[byte-count]
     # uint32_t crc32
     def data_packet_received(self, _data):
+        self.blocks_received += 1
+
         if self.state != STATE_RECEIVE:
-            print(f"Unexpected data packet, REFUSE\n{dump(_data)}")
+            logger.debug(f"Unexpected data packet, REFUSE\n{dump(_data)}")
             send_immediate_refuse(self.iface, self.session_id, self.destinationId, b'Unexpected data packet')
 
         data = _data[2:] # strip 0xDADA from the start
@@ -301,19 +327,19 @@ class Session:
 
         # good block
         if len(self.blocks[block_num]) > 0:
-            print(f"Block #{block_num} is dupe, IGNORE")
+            logger.debug(f"Block #{block_num} is dupe, IGNORE")
+            self.blocks_rejected += 1
             return
         
         self.blocks[block_num] = block_data
-        print(f"Block #{block_num} happily received")
+        logger.debug(f"Block #{block_num} happily received")
         self.delay = 0 # report status without waiting
 
         recv_map = "".join(['.' if len(b) == 0 else '#' for b in self.blocks])
         have = recv_map.count("#")
-        #remain = recv_map.count(".")
-        print(f"Received {have}/{len(recv_map)} blocks: [{recv_map}]");
+        logger.warning(f"Received {have}/{len(recv_map)} blocks: [{recv_map}] {get_channel_stats(self.iface)}");
         if recv_map.find('.') == -1:
-            print(f"Received all blocks, finish")
+            logger.warning(f"Received all blocks, finishing; {self.get_recv_stats()}")
             self.state = STATE_RECEIVE_FINISHING
             self.retry_count = 3
             self.save_received_file()
@@ -327,22 +353,21 @@ class Session:
             # am receiver, waiting for sender to acknowledge finished transfer
             if code == 0xBABE:
                 self.state = STATE_FINISHED
-                print(f"Sender acknowledged, finished session")
+                logger.warning(f"Sender acknowledged, finished session")
                 return
 
         if not self.state in [STATE_INITIATE_SEND, STATE_SEND]:
-            print(f"Unexpected status packet state={self.state}\n{dump(data)}")
+            logger.debug(f"Unexpected status packet state={self.state}\n{dump(data)}")
 
-        print(f"status_packet_received: code={code:04X}\n{dump(data)}")
+        logger.debug(f"status_packet_received: code={code:04X}\n{dump(data)}")
         if code == 0xFECC:
             why = data[2:].decode("utf-8")
-            print(f"Recipient refused: {why}, ABORT")
+            logger.warning(f"Recipient refused: {why}, ABORT")
             self.state = STATE_ABORTED
             return
 
         if code != 0xACCE:
-            print(f"code={repr(code)} bytes={repr(data)}")
-            print(f"Unknown packet type {code:04X}, IGNORE\n{dump(data)}")
+            logger.debug(f"Unknown packet type {code:04X}, IGNORE\n{dump(data)}")
         status = data[2:]
         update = self.decode_status_map(status)
         
@@ -352,11 +377,12 @@ class Session:
                 self.send_map[n] = math.inf # mark block as complete
             else:
                 remain += 1
+        sent = len(self.blocks) - remain
 
-        print(f"Transfer status: {remain}/{len(self.blocks)} unconfirmed\n[{str_send_map(self.send_map, self.resend_map)}]")
+        logger.warning(f"Sent {sent}/{len(self.blocks)}: [{str_send_map(self.send_map, self.resend_map)}] {get_channel_stats(self.iface)}")
 
         if remain == 0:
-            print(f"Sending {self.file_path} complete")
+            logger.warning(f"Sending {self.file_path} complete; {self.get_send_stats()}")
             send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
             send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
             send_immediate_general_ack(self.iface, self.session_id, self.destinationId)
@@ -375,13 +401,14 @@ class Session:
                 # resend initial request until we receive ACCE or FECC
                 self.delay = SEND_START_INTERVAL_TICKS
                 sendrq = self.make_send_request()
-                print(f"sendrq: [{sendrq}]")
+                logger.debug(f"sendrq: [{sendrq}]")
+                self.start_time = time.monotonic()
                 self.iface.sendData(sendrq.encode("utf-8"), destinationId=self.destinationId, portNum=HELLO_APP, wantAck=False)
             else:
                 self.delay -= 1
         elif self.state == STATE_SEND:
             if self.delay <= 0:
-                self.delay = BODY_INTERVAL_TICKS
+                self.delay = BODY_INTERVAL_TICKS + random.randint(-3,3)
                 self.send_data_packet()
         elif self.state == STATE_RECEIVE:
             if self.delay <= 0:
@@ -401,7 +428,7 @@ class Session:
         sid = session_id_as_array(self.session_id)
         data = sid + [0xac, 0xce] + self.make_status_map()
         self.iface.sendData(bytes(data), destinationId=self.destinationId, portNum=DATA_APP, wantAck=False)
-        print(f"send_status_packet:\n{dump(data)}")
+        logger.debug(f"send_status_packet:\n{dump(data)}")
 
     def save_received_file(self):
         contents = b''.join(self.blocks)
@@ -414,8 +441,21 @@ class Session:
             f.write(contents)
         set_timestamp(self.file_path, self.file_timestamp)
 
-    def matches(self, other):
-        return False
+    def get_send_stats(self):
+        ratio = self.blocks_sent / len(self.blocks)
+        elapsed = time.monotonic() - self.start_time
+        cps = self.file_size / elapsed
+        fmts = format_seconds(elapsed)
+        text = f"blocks: {len(self.blocks)} sent: {self.blocks_sent} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
+        return text
+
+    def get_recv_stats(self):
+        elapsed = time.monotonic() - self.start_time
+        cps = self.file_size / elapsed
+        fmts = format_seconds(elapsed)
+        ratio = self.blocks_received / len(self.blocks)
+        text = f"blocks: {len(self.blocks)} received: {self.blocks_received} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
+        return text
 
 class Scheduler:
     def __init__(self):
@@ -430,7 +470,7 @@ class Scheduler:
         self.shortName = info["user"]["shortName"]
 
         #self.my_node_num = self.iface.myInfo.myNodeNum
-        print(f"Connected to: {self.shortName} {self.longName} {self.id}")
+        logger.warning(f"Connected to: {self.shortName} {self.longName} {self.id}")
         pub.subscribe(self.on_receive, "meshtastic.receive")
 
     def find_existing_session(self, newsession):
@@ -460,7 +500,7 @@ class Scheduler:
 
         if portnum == 'TEXT_MESSAGE_APP' or portnum == HELLO_APP:
             text = packet["decoded"].get("text", "")
-            print(f"TEXT_MESSAGE_APP text={text}")
+            logger.debug(f"TEXT_MESSAGE_APP text={text}")
             s = Session()
             if s.parse_initial_packet(text):
                 # check if exactly the same file exists
@@ -470,7 +510,7 @@ class Scheduler:
                 # send request, remember session, initiate reception
                 old_sid, old_session = self.find_existing_session(s)
                 if old_session == None:
-                    print(f"New session {s.session_id} for file {s.file_path}")
+                    logger.info(f"New session {s.session_id} for file {s.file_path}")
                     self.sessions[s.session_id] = s
                     s.start_receive(interface, fromId)
                 else:
@@ -480,7 +520,7 @@ class Scheduler:
                         self.sessions[s.session_id] = old_session
                         del self.sessions[old_sid]
                         self.refused_sessions[old_sid] = old_sid
-                        print(f"Found old session {old_sid}, updating to {s.session_id}")
+                        logger.info(f"Found old session {old_sid}, updating to {s.session_id}")
         elif portnum == DATA_APP:
             sid = self.get_session_id(payload)
             code = 0
@@ -489,14 +529,14 @@ class Scheduler:
             except:
                 pass
             if sid in self.sessions:
-                print(f"DATA_APP sid={sid} {code:04X} for existing session")
+                logger.debug(f"DATA_APP sid={sid} {code:04X} for existing session")
                 self.sessions[sid].packet_received(payload[4:])
             else:
                 if sid in self.refused_sessions:
-                    print(f"DATA_APP sid={sid} is previously refused, IGNORE")
+                    logger.debug(f"DATA_APP sid={sid} is previously refused, IGNORE")
                 else:
                     self.refused_sessions[sid] = sid
-                    print(f"DATA_APP sid={sid} is unknown, REFUSE")
+                    logger.debug(f"DATA_APP sid={sid} is unknown, REFUSE")
                     send_immediate_refuse(self.iface, sid, fromId, b'Unknown session')
 
     # returns 4-byte session id as 8-character string
@@ -512,10 +552,10 @@ class Scheduler:
 
         dstId, longId = get_destinationId(self.iface, recipient)
         if dstId == None:
-            print(f"Could not find destinationId for [{recipient}]")
+            logger.warning(f"Could not find destinationId for [{recipient}]")
             return False
 
-        print(f"Found {recipient}: {dstId} {longId}")
+        logger.warning(f"Found {recipient}: {dstId} {longId}")
 
         s.start_send(self.iface, dstId, path)
         self.sessions[s.session_id] = s
@@ -529,7 +569,7 @@ class Scheduler:
                 kills.append(session.session_id)
 
         for k in kills:
-            print(f"Cleaned up session {k}")
+            logger.info(f"Cleaned up session {k}")
             del self.sessions[k]
 
 
@@ -573,8 +613,10 @@ if __name__ == '__main__':
         mode = sys.argv[1]
         if mode == "send":
             file, did = sys.argv[2:4]
+            logger = setup_logger("send")
+        else:
+            logger = setup_logger("receive")
     except Exception as e:
-        print(f"Eggog: {e}")
         print("Usage: \n\tmeshku send filename.ext recipient-id\n\tmeshku receive")
         exit(1)
 
@@ -583,7 +625,7 @@ if __name__ == '__main__':
     if mode == "send":
         scheduler.send_file(file, did)
 
-    print("Created scheduler")
+    logger.debug("Created scheduler")
     while True:
         scheduler.sched()
         time.sleep(TICK_TIME)
