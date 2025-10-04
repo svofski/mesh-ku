@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
 import os, sys
 import zlib
 from pathlib import Path
 import time
-import secrets
-import hashlib
 import math
 import struct
 import random
@@ -17,29 +14,9 @@ from pubsub import pub
 import logging
 
 from meshku import *
+from util import *
 
 logger=None
-
-def setup_logger(role):
-    logger = logging.getLogger("mesh-ku-" + role)
-    logger.setLevel(logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    fh1 = logging.FileHandler(role + "-events.log")
-    fh1.setLevel(logging.INFO)
-    fh1.setFormatter(fmt)
-    logger.addHandler(fh1)
-
-    fh2 = logging.FileHandler(role + "-debug.log")
-    fh2.setLevel(logging.DEBUG)
-    fh2.setFormatter(fmt)
-    logger.addHandler(fh2)
-
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.WARNING)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-    return logger
 
 
 def get_channel_stats(iface):
@@ -57,56 +34,6 @@ def send_immediate_refuse(iface, sid, destId, why=b""):
 def send_immediate_general_ack(iface, sid, destId):
     data = session_id_as_array(sid) + [0xba, 0xbe]
     iface.sendData(bytes(data), destinationId=destId, portNum=DATA_APP, wantAck=False)
-
-def str_send_map(send_map, resend_map):
-    # inf -> '#'
-    pic = ".0123456789+"
-    x = ['#' if math.isinf(x) else pic[min(c,len(pic)-1)] for x,c in zip(send_map, resend_map)]
-    return ''.join(x)
-
-def create_unique_session_id():
-    """Generates a unique session ID using timestamp, random salt, and hashing."""
-    # 1. Get the current high-resolution timestamp
-    timestamp = str(time.time())
-
-    # 2. Generate a cryptographically secure random salt
-    # A 32-byte salt is very secure and is a standard size for many algorithms.
-    salt = secrets.token_bytes(32)
-
-    # 3. Concatenate the timestamp and salt, then hash them
-    # Use a strong hashing algorithm like SHA-256
-    id_data = timestamp.encode('utf-8') + salt
-    session_id_hash = hashlib.sha256(id_data).hexdigest()
-
-    return session_id_hash
-
-
-def set_timestamp(path, timestamp_str):
-    ts = int(timestamp_str)
-    # set both atime and mtime to the same value
-    os.utime(path, (ts, ts))
-
-def get_timestamp(path):
-    mod_time_float = os.path.getmtime(path)
-    mod_time_int = int(mod_time_float)
-    return str(mod_time_int)
-
-def read_file(path):
-    try:
-        timestamp = get_timestamp(path)
-        crc32 = 0
-        content = None
-        with open(path, "rb") as file:
-            content = bytearray(file.read())
-            crc32 = zlib.crc32(content)
-        return content, timestamp, crc32
-    except:
-        return None, 0, 0
-
-def chunk_bytearray(data, chunk_size):
-    """Yields chunks of a bytearray of a specified size."""
-    for i in range(0, len(data), chunk_size):
-        yield data[i:i + chunk_size]
 
 class StatusMap:
     # convert blocks map into bitmap for status report,  0 = need, 1 = received
@@ -134,6 +61,14 @@ class StatusMap:
                 filemap.append(yesno)
                 b <<= 1
         return filemap
+
+    # printable map that shows unsent/resend count/completed
+    @staticmethod
+    def sendmap_str(send_map, resend_map):
+        # inf -> '#'
+        pic = ".0123456789+"
+        x = ['#' if math.isinf(x) else pic[min(c,len(pic)-1)] for x,c in zip(send_map, resend_map)]
+        return ''.join(x)
 
 class Stats:
     def __init__(self):
@@ -165,6 +100,49 @@ class Stats:
         text = f"blocks: {self.num_blocks} received: {self.blocks_received} ratio: {ratio:.2f} elapsed: {fmts} cps: {cps:.1f}"
         return text
 
+class DataPacket:
+    # packet_bytes without session_id!
+    # uint16_t 0xDADA
+    # uint16_t block-num
+    # uint8_t byte-count
+    # uint8_t array[byte-count]
+    # uint32_t crc32
+    @staticmethod
+    def inbound(packet_bytes: bytes) -> tuple[int, bytes, int, str]:
+        data = packet_bytes[2:] # strip 0xDADA from the start
+        block_num, block_len = struct.unpack_from('<HB', data, 0)
+        data_start, data_end = 3, 3 + block_len
+        block_data = data[3: 3 + block_len]
+        crc_start = data_end
+        if len(data) != crc_start + 4:
+            return None, None, None, f"Buffer size mismatch: block #{block_num}/{block_len}bytes need: {crc_start+4} bytes, have: {len(data)} bytes: [{dump(data)}]"
+        in_crc32, = struct.unpack_from('<I', data, crc_start)
+
+        my_crc32 = zlib.crc32(block_data)
+        if my_crc32 != in_crc32:
+            return None, None, None, f"CRC32 error block #{block_num}/{block_len}bytes need: {in_crc:08x} have: {my_crc32}"
+
+        return block_num, block_data, in_crc32, None
+        
+
+    # uint32_t session_id
+    # uint16_t 0xDADA
+    # uint16_t block-num (little-endian)
+    # uint8_t byte-count
+    # uint8_t array[byte-count]
+    # uint32_t crc32
+    @staticmethod
+    def outbound(session_id, block_num, block_bytes: bytes) -> bytes:
+        header = session_id_as_array(session_id)
+        header.append(0xda)
+        header.append(0xda)
+        header.append(block_num & 0xff);
+        header.append((block_num >> 8) & 0xff);
+        header.append(len(block_bytes))
+        crc32 = zlib.crc32(block_bytes)
+        crc32_bytes = crc32.to_bytes(4, 'little')
+        return bytes(header) + block_bytes + crc32_bytes
+
 
 STATE_INITIAL = 0
 STATE_INITIATE_SEND = 2
@@ -176,7 +154,7 @@ STATE_ABORTED = 255
 
 
 class Session:
-    def __init__(self, file_path = None, session_id = None, block_size = DEFAULT_BLOCK_SIZE):
+    def __init__(self, file_path = None, dstId = None, session_id = None, block_size = DEFAULT_BLOCK_SIZE):
         self.session_id = session_id
         self.file_path = file_path
         self.file_timestamp = 0
@@ -186,7 +164,7 @@ class Session:
         self.receiving = False
         self.finished = False
         self.iface = None
-        self.destinationId = None
+        self.destinationId = dstId
         self.crc32 = 0
         self.sender_version = "unknown"
         self.send_map = []      # smallest number gets sent, 
@@ -198,16 +176,14 @@ class Session:
         return f"Session: file_path={self.file_path} file_timestamp={self.file_timestamp} file_size={self.file_size} " + \
                 f"block_size: {self.block_size} crc32: {self.crc32} sender_version={self.sender_version} session_id={self.session_id}"
 
-
     #
     # SENDER SIDE ------------->
     #
 
-    # s = Session(path)
-    # s.start_send(iface, recipient)
-    def start_send(self, iface, destinationId):
+    # s = Session(path, dstId=recipient)
+    # s.start_send(iface)
+    def start_send(self, iface):
         self.iface = iface
-        self.destinationId = destinationId
         self.state = STATE_INITIATE_SEND
         self.delay = 0
         self.prepare_to_send()
@@ -240,32 +216,13 @@ class Session:
             return -1
         index = s.index(min_value)
 
-        # decrement everything by 1
         for i in range(len(s)):
-            s[i] = s[i] - 1
+            s[i] = s[i] - 1     # decrement everything by 1
         
-        s[index] = len(s) - 1  # make the picked block the last to retransmit
+        s[index] = len(s) - 1   # put the picked block in the back of the queue
         return index
 
-    # uint32_t session_id
-    # uint16_t 0xDADA
-    # uint16_t block-num (little-endian)
-    # uint8_t byte-count
-    # uint8_t array[byte-count]
-    # uint32_t crc32
-    def make_data_packet(self, block_num):
-        header = session_id_as_array(self.session_id)
-        header.append(0xda)
-        header.append(0xda)
-        header.append(block_num & 0xff);
-        header.append((block_num >> 8) & 0xff);
-        header.append(len(self.blocks[block_num]))
-        crc32 = zlib.crc32(self.blocks[block_num])
-        crc32_bytes = crc32.to_bytes(4, 'little')
-        return bytes(header) + self.blocks[block_num] + crc32_bytes
-
     def send_data_packet(self):
-        # pick a block to send
         pick = self.pick_block_to_send(self.send_map) 
         if pick == -1:
             self.state = STATE_FINISHED
@@ -273,7 +230,7 @@ class Session:
             return False
         self.resend_map[pick] += 1
         
-        data = self.make_data_packet(pick)
+        data = DataPacket.outbound(self.session_id, pick, self.blocks[pick])
         self.iface.sendData(data, destinationId=self.destinationId, portNum=DATA_APP, wantAck=False)
         self.stats.blocks_sent += 1
 
@@ -314,7 +271,7 @@ class Session:
                 remain += 1
         sent = len(self.blocks) - remain
 
-        logger.warning(f"Sent {sent}/{len(self.blocks)}: [{str_send_map(self.send_map, self.resend_map)}] {get_channel_stats(self.iface)}")
+        logger.warning(f"Sent {sent}/{len(self.blocks)}: [{StatusMap.sendmap_str(self.send_map, self.resend_map)}] {get_channel_stats(self.iface)}")
 
         if remain == 0:
             logger.warning(f"Sending {self.file_path} complete; {self.stats.send_stats()}")
@@ -326,7 +283,6 @@ class Session:
         # good to go
         if self.state == STATE_INITIATE_SEND:
             self.state = STATE_SEND
-
 
 
     #
@@ -372,34 +328,24 @@ class Session:
         self.delay = 0
         self.init_blocks()
         self.stats.begin(self.file_size, len(self.blocks))
-        logger.info(f"start_receive: from {senderId} expecting {len(self.blocks)} blocks")
+        logger.warning(f"Receiving {self.file_path} from {senderId}, {self.file_size} bytes {len(self.blocks)} blocks")
 
-    # uint16_t block-num
-    # uint8_t byte-count
-    # uint8_t array[byte-count]
-    # uint32_t crc32
-    def data_packet_received(self, _data):
+    # data packet, session_id stripped
+    def data_packet_received(self, data: bytes):
         self.stats.blocks_received += 1
 
         if self.state != STATE_RECEIVE:
-            logger.debug(f"Unexpected data packet, REFUSE\n{dump(_data)}")
+            logger.debug(f"Unexpected data packet, REFUSE\n{dump(data)}")
             send_immediate_refuse(self.iface, self.session_id, self.destinationId, b'Unexpected data packet')
 
-        data = _data[2:] # strip 0xDADA from the start
-        block_num, block_len = struct.unpack_from('<HB', data, 0)
-        data_start, data_end = 3, 3 + block_len
-        block_data = data[3: 3 + block_len]
-        crc_start = data_end
-        if len(data) != crc_start + 4:
-            raise ValueError(f"Buffer size mismatch: block #{block_num}/{block_len}bytes need: {crc_start+4} bytes, have: {len(data)} bytes: [{repr(data)}]")
-        in_crc32, = struct.unpack_from('<I', data, crc_start)
-
-        my_crc32 = zlib.crc32(block_data)
-        if my_crc32 != in_crc32:
-            raise ValueError(f"CRC32 error block #{block_num}/{block_len}bytes need: {in_crc:08x} have: {my_crc32}")
+        block_num, block_data, crc32, _err = DataPacket.inbound(data)
+        if _err != None:
+            logger.info(_err)
+            return
 
         if block_num >= len(self.blocks):
-            raise ValueError(f"Unexpected block #{block_num} out of {len(self.blocks)}")
+            logger.info(f"Unexpected block #{block_num} out of {len(self.blocks)}")
+            return
 
         # good block
         if len(self.blocks[block_num]) > 0:
@@ -436,6 +382,10 @@ class Session:
         with open(fname, "wb") as f:
             f.write(contents)
         set_timestamp(self.file_path, self.file_timestamp)
+
+    #
+    # ------- COMMON --------
+    #
 
     # data is raw packet data with session_id stripped
     def packet_received(self, data):
@@ -486,9 +436,10 @@ class Session:
 # calls Session.tick() for active sessions
 # kills old sessions
 class Scheduler:
-    def __init__(self):
+    def __init__(self, hostname):
         self.sessions = {}
         self.refused_sessions = {}
+        self.send_queue = [] # send sessions
 
         self.iface = meshtastic.serial_interface.SerialInterface()
         info = self.iface.getMyNodeInfo()
@@ -498,7 +449,7 @@ class Scheduler:
         self.shortName = info["user"]["shortName"]
 
         #self.my_node_num = self.iface.myInfo.myNodeNum
-        logger.warning(f"Connected to: {self.shortName} {self.longName} {self.id}")
+        logger.warning(f"Connected to: {self.shortName} {self.longName} {self.id} on {hostname}")
         pub.subscribe(self.on_receive, "meshtastic.receive")
 
     def find_existing_session(self, newsession):
@@ -574,22 +525,20 @@ class Scheduler:
         return f"{sid:08x}"
 
 
-    def send_file(self, path, recipient):
-        s = Session(path)
+    def send_file(self, path, dstId):
+        s = Session(path, dstId=dstId)
 
-        dstId, longId = get_destinationId(self.iface, recipient)
-        if dstId == None:
-            logger.warning(f"Could not find destinationId for [{recipient}]")
-            return False
+        for sid in self.sessions.copy():
+            if self.sessions[sid].state in [STATE_INITIATE_SEND, STATE_SEND]:
+                self.send_queue += [s]
+                return
 
-        logger.warning(f"Found {recipient}: {dstId} {longId}")
-
-        s.start_send(self.iface, dstId)
+        s.start_send(self.iface)
         self.sessions[s.session_id] = s
 
     def sched(self):
         kills = []
-        for s in self.sessions:
+        for s in self.sessions.copy():
             session = self.sessions[s]
             if not session.tick():
                 kills.append(session.session_id)
@@ -598,68 +547,15 @@ class Scheduler:
             logger.info(f"Cleaned up session {k}")
             del self.sessions[k]
 
-
-def tets():
-    s=Session()
-    s.parse_initial_packet("KU! test.txt 1759394612 157 64 444085881 V001 c8e4a0f9")
-    s.start_receive(None, "!abcd")
-    return s
-
-def tets2():
-    s=Session()
-    s.parse_initial_packet("KU! test.txt 1759394612 157 64 444085881 V001 c8e4a0f9")
-    s.start_receive(None, "!abcd")
-    s.blocks=[[1],[1],[],[],[1],[1],[1],[1],[],[1],[]]
-    decoded = StatusMap.decode(StatusMap.encode(s))
-    print(f"status map decoded: {repr(decoded)}")
-    return s
-
-def tets3():
-    s = Session('../test.txt')
-    s.prepare_to_send()
-    return s
-
-def tets4():
-    send = Session('../test.txt')
-    send.prepare_to_send()
-    req = send.make_send_request()
-
-    recv = Session()
-    recv.parse_initial_packet(req)
-    recv.start_receive(None, "!abcd")
-
-    packet = send.make_data_packet(2)
-    recv.data_packet_received(packet[4:])
-
-    return send, recv
-
-
-if __name__ == '__main__':
-    try:
-        mode = sys.argv[1]
-        if mode == "send":
-            file, did = sys.argv[2:4]
-            logger = setup_logger("send")
-        else:
-            logger = setup_logger("receive")
-    except Exception as e:
-        print("Usage: \n\tmeshku send filename.ext recipient-id\n\tmeshku receive")
-        exit(1)
-
-    scheduler = Scheduler()
-
-    if mode == "send":
-        scheduler.send_file(file, did)
-
-    logger.debug("Created scheduler")
-    while True:
-        scheduler.sched()
-        time.sleep(TICK_TIME)
-
-
-
-
-
-
+        # check if there are active sending sessions and return if yes
+        for sid in self.sessions.copy():
+            if self.sessions[sid].state in [STATE_INITIATE_SEND, STATE_SEND]:
+                return
+        
+        # no active sending sessions, check send queue and initiate a new one if not empty
+        if len(self.send_queue) > 0:
+            s = self.send_queue.pop(0)
+            s.start_send(self.iface)
+            self.sessions[s.session_id] = s
 
 

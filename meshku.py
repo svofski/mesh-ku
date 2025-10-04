@@ -1,4 +1,8 @@
+#!/usr/bin/env python3
 import os
+from util import *
+import logging
+import session
 
 DEFAULT_BLOCK_SIZE=128
 MAX_RESEND_COUNT=333
@@ -36,69 +40,52 @@ PRIVATE_APP = 256
 HELLO_APP=TEXT_MESSAGE_APP
 DATA_APP=PRIVATE_APP+44
 
+def setup_logger(role):
+    logger = logging.getLogger("mesh-ku-" + role)
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-def get_destinationId(iface, recipient):
-    known_nodes = iface.nodes
-    if not recipient in known_nodes:
-        if "!" + recipient in known_nodes:
-            recipient = "!" + recipient
-        else:
-            for node_id, node_data in known_nodes.items():
-                if node_id[-4::] == recipient:
-                    recipient = node_id
-                    break
-                user_info = node_data.get('user', {})
-                long_name = user_info.get('longName', '')
-                short_name = user_info.get('shortName', '')
-                if long_name == recipient or short_name == recipient:
-                    recipient = node_id
-                    break
+    fh1 = logging.FileHandler(role + "-events.log")
+    fh1.setLevel(logging.INFO)
+    fh1.setFormatter(fmt)
+    logger.addHandler(fh1)
 
-    if recipient in known_nodes:
-        node_data = known_nodes[recipient]
-        user_info = node_data.get('user', {})
-        long_name = user_info.get('longName', 'N/A')
-        return recipient, long_name
+    fh2 = logging.FileHandler(role + "-debug.log")
+    fh2.setLevel(logging.DEBUG)
+    fh2.setFormatter(fmt)
+    logger.addHandler(fh2)
 
-    return None, None
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    return logger
 
+if __name__ == '__main__':
+    hostname = short_hostname()
+    session.logger = setup_logger(hostname)
+    scheduler = session.Scheduler(hostname)
 
-def session_id_as_array(sid):
-    return [x for x in bytes.fromhex(sid)]
+    try:
+        mode = sys.argv[1]
+        if mode == "send":
+            did = sys.argv[2]
+            files = sys.argv[3:]
+            dstId, longId = get_destinationId(scheduler.iface, did)
+            if dstId == None:
+                session.logger.warning(f"Could not find nodedb entry for [{did}]")
+                exit(1)
+            session.logger.warning(f"Resolved {did} as {dstId} {longId}")
+    except Exception as e:
+        print(e)
+        print("Usage: \n\tmeshku send recipient-id file1 file2... \n\tmeshku receive")
+        exit(1)
 
-def dump(data):
-    text = ""
-    nlines = len(data)//16
-    if len(data) & 15 != 0:
-        nlines += 1
-    for line in range(nlines):
-        line_data = data[line * 16: line * 16 + 16]
-        hexual = f"{line*16:04x}: "
-        hexual += "".join([f"{x:02x}{'-' if i == 7 else ' '}" for i, x in enumerate(line_data)])
-        charals = "".join([chr(x) if x > ord(' ') and x < 128 else '.' for x in line_data])
+    if mode == "send":
+        for f in files:
+            scheduler.send_file(f, dstId)
 
-        text += f"{hexual:56s}  {charals:16s}\n"
-        
-    return text
-
-def safe_filename(fname):
-    base, ext = os.path.splitext(fname)
-    counter = 1
-    newname = fname
-    while os.path.exists(newname):
-        newname = f"{base}_{counter}{ext}"
-        counter += 1
-    return newname
-
-def format_seconds(seconds: int) -> str:
-    seconds = int(seconds)
-    h, m = divmod(seconds, 3600)
-    m, s = divmod(m, 60)
-
-    parts = []
-    if h:
-        parts.append(f"{h}h")
-    if m:
-        parts.append(f"{m}m")
-    parts.append(f"{s}s")
-    return " ".join(parts)
+    session.logger.debug("Created scheduler")
+    while True:
+        scheduler.sched()
+        time.sleep(TICK_TIME)

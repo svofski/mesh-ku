@@ -23,12 +23,13 @@ Basic usage
 
 Wait for incoming files. Files will be saved in the current directory.
 
-`python3 session.py receive`
+`./meshku.py receive`
 
 Send a file. Destination can be a short or long name or full node id. Path to file will be stripped.
 
-`python3 session.py send path/to/file.ext <destination>`
+`./meshku.py send <destination> path/to/file1 path/to/file2 ...`
 
+You can start both parties in send mode and they will exchange files.
 
 
 Packet types
