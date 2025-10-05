@@ -17,6 +17,7 @@ pip3 install meshtastic
 ```
 
 This is dangerous experimental software. It will overwrite files and do other nasty things when you look away.
+Most importantly it will waste all your ducy cycle counters, and those of your network neighbours, if you're not careful.
 
 Basic usage
 -----------
